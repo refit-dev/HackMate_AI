@@ -1,13 +1,62 @@
 import Stripe from 'stripe'
 import { updateUserSubscription, SUBSCRIPTION_PLANS } from './subscription'
 
+type PeriodItem = { price?: { id?: string } | null };
+type PeriodField = 'current_period_start' | 'current_period_end';
+type PlanItem = (items: PeriodItem[]) => PeriodItem | undefined;
+
+// Typed like the removed field, which was also absent at runtime when Stripe omitted it.
+function subscriptionPeriod(subscription: object, field: PeriodField, planItem?: PlanItem): number {
+  const legacy: unknown = Reflect.get(subscription, field);
+  if (typeof legacy === 'number') return legacy;
+  const list: unknown = Reflect.get(subscription, 'items');
+  const data: unknown = list && typeof list === 'object' ? Reflect.get(list, 'data') : undefined;
+  const items = (Array.isArray(data) ? data : []).filter(
+    (item): item is PeriodItem => typeof item === 'object' && item !== null,
+  );
+  const periods = new Set(items.map((item) => Reflect.get(item, field)));
+  const chosen = periods.size === 1 ? items[0] : planItem?.(items);
+  const value: unknown = chosen ? Reflect.get(chosen, field) : undefined;
+  return (typeof value === 'number' ? value : undefined) as number;
+}
+
+function getSubscriptionPeriodStart(subscription: object, planItem?: PlanItem): number {
+  return subscriptionPeriod(subscription, 'current_period_start', planItem);
+}
+
+function getSubscriptionPeriodEnd(subscription: object, planItem?: PlanItem): number {
+  return subscriptionPeriod(subscription, 'current_period_end', planItem);
+}
+
+// Typed like the removed field under old stripe types, like the new location under new ones.
+type InvoiceSubscription<T> = T extends { subscription: infer S }
+  ? S
+  : T extends { parent: infer P }
+    ? NonNullable<P> extends { subscription_details: infer D }
+      ? NonNullable<D> extends { subscription: infer S }
+        ? S | null
+        : string | null
+      : string | null
+    : string | null;
+
+// The old top-level field when present (old-version payloads), otherwise the new location.
+function getInvoiceSubscription<T extends object>(invoice: T): InvoiceSubscription<T> {
+  const legacy: unknown = Reflect.get(invoice, 'subscription');
+  const parent: unknown = Reflect.get(invoice, 'parent');
+  const details: unknown =
+    parent && typeof parent === 'object' ? Reflect.get(parent, 'subscription_details') : undefined;
+  const moved: unknown =
+    details && typeof details === 'object' ? Reflect.get(details, 'subscription') : undefined;
+  return (legacy !== undefined ? legacy : (moved ?? null)) as InvoiceSubscription<T>;
+}
+
 // Don't crash build if key is missing, just warn
 if (!process.env.STRIPE_SECRET_KEY) {
   console.warn('STRIPE_SECRET_KEY is not set. Stripe functionality will fail at runtime.')
 }
 
 export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_placeholder_for_build', {
-  apiVersion: '2025-02-24.acacia',
+  apiVersion: '2026-09-30.endive',
   typescript: true,
 })
 
@@ -128,8 +177,8 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
     status: subscription.status as any,
     stripe_subscription_id: subscription.id,
     stripe_customer_id: subscription.customer as string,
-    current_period_start: new Date(subscription.current_period_start * 1000),
-    current_period_end: new Date(subscription.current_period_end * 1000),
+    current_period_start: new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000),
+    current_period_end: new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000),
     trial_end: subscription.trial_end ? new Date(subscription.trial_end * 1000) : undefined,
   })
   
@@ -158,8 +207,8 @@ async function handleSubscriptionUpdated(subscription: Stripe.Subscription) {
   await updateUserSubscription(userId, {
     plan: planId,
     status: subscription.status as any,
-    current_period_start: new Date(subscription.current_period_start * 1000),
-    current_period_end: new Date(subscription.current_period_end * 1000),
+    current_period_start: new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000),
+    current_period_end: new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000),
     trial_end: subscription.trial_end ? new Date(subscription.trial_end * 1000) : undefined,
   })
   
@@ -183,7 +232,7 @@ async function handleSubscriptionDeleted(subscription: Stripe.Subscription) {
 }
 
 async function handlePaymentSucceeded(invoice: Stripe.Invoice) {
-  const subscriptionId = invoice.subscription as string
+  const subscriptionId = (getInvoiceSubscription(invoice)) as string
   
   if (!subscriptionId) return
   
@@ -200,7 +249,7 @@ async function handlePaymentSucceeded(invoice: Stripe.Invoice) {
 }
 
 async function handlePaymentFailed(invoice: Stripe.Invoice) {
-  const subscriptionId = invoice.subscription as string
+  const subscriptionId = (getInvoiceSubscription(invoice)) as string
   
   if (!subscriptionId) return
   
